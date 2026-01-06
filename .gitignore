@@ -16,3 +16,7 @@ diff-gaussian-rasterization
 *.sh
 *.mp4
 dataset
+
+simple_knn/
+simple-waymo-open-dataset-reader/
+sam_vit_h_4b8939.pth

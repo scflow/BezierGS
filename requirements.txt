@@ -1,6 +1,6 @@
-torch==2.0.1 
-torchvision==0.15.2
-numpy==1.26.3
+torch
+torchvision
+numpy
 tqdm
 imageio
 imageio[ffmpeg]
@@ -15,3 +15,4 @@ opencv_contrib_python
 tensorboardX
 matplotlib
 open3d
+mmcv-full

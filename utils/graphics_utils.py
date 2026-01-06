@@ -14,6 +14,41 @@ import math
 import numpy as np
 from typing import NamedTuple
 
+def project_numpy(xyz, K, RT, H=None, W=None):
+    xyz = np.asarray(xyz)
+    orig_shape = xyz.shape
+    xyz = xyz.reshape(-1, 3)
+    K = np.asarray(K)
+    RT = np.asarray(RT)
+
+    if RT.shape == (4, 4):
+        cam_xyz = xyz @ RT[:3, :3].T + RT[:3, 3]
+    elif RT.shape == (3, 4):
+        cam_xyz = xyz @ RT[:3, :3].T + RT[:3, 3]
+    elif RT.shape == (3, 3):
+        cam_xyz = xyz @ RT.T
+    else:
+        raise ValueError(f"RT should be 3x3, 3x4, or 4x4, got {RT.shape}")
+
+    cam_z = cam_xyz[:, 2]
+    valid = cam_z > 1e-6
+    cam_xyz = cam_xyz.copy()
+    cam_xyz[~valid, 2] = 1e-6
+
+    uv = cam_xyz @ K.T
+    uv = uv[:, :2] / uv[:, 2:3]
+
+    if H is not None and W is not None:
+        in_img = (
+            (uv[:, 0] >= 0) & (uv[:, 0] < W) &
+            (uv[:, 1] >= 0) & (uv[:, 1] < H)
+        )
+        valid = valid & in_img
+
+    uv = uv.reshape(*orig_shape[:-1], 2)
+    valid = valid.reshape(*orig_shape[:-1])
+    return uv, valid
+
 def ndc_2_cam(ndc_xyz, intrinsic, W, H):
     inv_scale = torch.tensor([[W - 1, H - 1]], device=ndc_xyz.device)
     cam_z = ndc_xyz[..., 2:3]

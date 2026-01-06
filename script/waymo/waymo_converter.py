@@ -12,9 +12,9 @@ from tqdm import tqdm
 from simple_waymo_open_dataset_reader import WaymoDataFileReader
 from simple_waymo_open_dataset_reader import dataset_pb2, label_pb2
 from simple_waymo_open_dataset_reader import utils
-from lib.utils.box_utils import bbox_to_corner3d, get_bound_2d_mask
-from lib.utils.img_utils import draw_3d_box_on_img
-from lib.utils.graphics_utils import project_numpy
+from utils.box_utils import bbox_to_corner3d, get_bound_2d_mask
+from utils.img_utils import draw_3d_box_on_img
+from utils.graphics_utils import project_numpy
 
 # castrack_path = '/nas/home/yanyunzhi/waymo/castrack/seq_infos/val/result.json'
 # with open(castrack_path, 'r') as f:

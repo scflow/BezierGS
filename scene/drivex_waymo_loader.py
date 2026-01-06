@@ -240,7 +240,13 @@ def readDriveXWaymoInfo(args):
             images.append(image)
             image_paths.append(image_path)
 
-            sky_path = os.path.join(args.source_path, "sky_mask", f"{t:03d}_{cam_idx}.png")
+            sky_path = os.path.join(args.source_path, "sky_mask", f"{t:06d}_{cam_idx}.png")
+            if not os.path.exists(sky_path):
+                sky_path = os.path.join(args.source_path, "sky_mask", f"{t:03d}_{cam_idx}.png")
+            if not os.path.exists(sky_path):
+                raise FileNotFoundError(
+                    f"Sky mask not found for frame {t} cam {cam_idx} in {args.source_path}/sky_mask"
+                )
             sky_data = Image.open(sky_path)
             sky_data = sky_data.resize((load_size[1], load_size[0]), Image.NEAREST)  # PIL resize: (W, H)
             sky_mask = np.array(sky_data) > 0
