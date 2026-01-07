@@ -465,7 +465,10 @@ def _export_scene_traj_json(path, frame_ids, frame_times, ego_track_frames,
             "tracks": {
                 "history": {
                     "source": "render",
-                    "states": ego_states,
+                    "trajectory": {
+                        "trajectory_id": "ego_history",
+                        "states": ego_states,
+                    },
                 }
             },
         })
@@ -484,7 +487,10 @@ def _export_scene_traj_json(path, frame_ids, frame_times, ego_track_frames,
                 "tracks": {
                     "observed": {
                         "source": "render",
-                        "states": obj_states,
+                        "trajectory": {
+                            "trajectory_id": f"{obj_id}_observed",
+                            "states": obj_states,
+                        },
                     }
                 },
             })

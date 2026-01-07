@@ -2,6 +2,8 @@
 # Visualize ego/objects trajectories with IDs and export an animated plot.
 #
 import json
+import os
+import sys
 from argparse import ArgumentParser
 
 import imageio
@@ -10,11 +12,18 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
 from utils.traj_schema import (collect_frame_times, extract_scene_tracks, is_scene_traj,
                                sample_positions_by_time)
 
 
 def _load_json(path):
+    if not path:
+        return None
     with open(path, "r") as f:
         return json.load(f)
 
@@ -108,26 +117,42 @@ def _load_scene_positions(scene_payload, ego_track, obj_track, pred_mode):
 
 def main():
     parser = ArgumentParser(description="Plot trajectories with IDs.")
-    parser.add_argument("--ego_json", type=str, required=True)
-    parser.add_argument("--obj_json", type=str, required=True)
+    parser.add_argument("--ego_json", type=str, default=None)
+    parser.add_argument("--obj_json", type=str, default=None)
+    parser.add_argument("--traj_json", type=str, default=None)
     parser.add_argument("--output", type=str, default="traj_overview.gif")
     parser.add_argument("--axes", choices=["xy", "xz", "yz"], default="xy")
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--frame_stride", type=int, default=1)
     parser.add_argument("--trail_length", type=int, default=0)
-    parser.add_argument("--show_history", action="store_true")
-    parser.add_argument("--label_ego", action="store_true")
-    parser.add_argument("--label_objects", action="store_true")
+    parser.add_argument("--show_history", action="store_true", help="显示他车轨迹历史（默认）。")
+    parser.add_argument("--no_show_history", action="store_false", dest="show_history",
+                        help="隐藏他车轨迹历史。")
+    parser.add_argument("--label_ego", action="store_true", help="显示 ego 标号。")
+    parser.add_argument("--label_objects", action="store_true", help="显示物体 ID（默认）。")
+    parser.add_argument("--no_label_objects", action="store_false", dest="label_objects",
+                        help="隐藏物体 ID。")
     parser.add_argument("--grid", action="store_true")
     parser.add_argument("--ego_track", type=str, default=None)
     parser.add_argument("--obj_track", type=str, default=None)
     parser.add_argument("--pred_mode", type=str, default=None)
+    parser.set_defaults(label_objects=True, show_history=True)
     args = parser.parse_args()
 
-    ego = _load_json(args.ego_json)
-    obj = _load_json(args.obj_json)
-    if is_scene_traj(ego) or is_scene_traj(obj):
-        scene_payload = ego if is_scene_traj(ego) else obj
+    scene_payload = None
+    if args.traj_json:
+        scene_payload = _load_json(args.traj_json)
+        if not is_scene_traj(scene_payload):
+            raise ValueError("traj_json must be a scene trajectory JSON with an agents list.")
+    else:
+        if not args.ego_json or not args.obj_json:
+            raise ValueError("Provide --traj_json or both --ego_json and --obj_json.")
+        ego = _load_json(args.ego_json)
+        obj = _load_json(args.obj_json)
+        if is_scene_traj(ego) or is_scene_traj(obj):
+            scene_payload = ego if is_scene_traj(ego) else obj
+
+    if scene_payload:
         frames, ego_positions, obj_positions_map = _load_scene_positions(
             scene_payload, args.ego_track, args.obj_track, args.pred_mode
         )
