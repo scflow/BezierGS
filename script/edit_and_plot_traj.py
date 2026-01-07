@@ -11,6 +11,8 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from utils.traj_schema import (is_scene_traj, resolve_states_ref, sample_positions_by_time,
+                               select_track, state_to_pos, state_to_time)
 
 
 def _load_json(path):
@@ -66,6 +68,63 @@ def _extract_ego_positions(frames, ego_frames):
         pts = entry.get("ego")
         positions.append(_last_point(pts) if pts else None)
     return positions
+
+
+def _extract_state_series(states, dt):
+    if not states:
+        return [], []
+    times = []
+    positions = []
+    for idx, state in enumerate(states):
+        fallback = float(idx)
+        if dt is not None:
+            fallback = float(idx) * dt
+        t_val = state_to_time(state, fallback)
+        pos = state_to_pos(state)
+        times.append(float(t_val))
+        positions.append(pos)
+    return times, positions
+
+
+def _resolve_time_index(frame_times, key):
+    try:
+        value = float(key)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid frame key '{key}'. Use index or time value.")
+    if float(value).is_integer():
+        idx = int(value)
+        if 0 <= idx < len(frame_times):
+            return idx
+    if not frame_times:
+        raise ValueError("No frame times available.")
+    deltas = np.abs(np.array(frame_times, dtype=np.float32) - float(value))
+    idx = int(np.argmin(deltas))
+    if deltas[idx] > 1e-4:
+        raise ValueError(f"Frame time '{key}' not found.")
+    return idx
+
+
+def _find_agent(scene_payload, agent_id):
+    for agent in scene_payload.get("agents", []):
+        if str(agent.get("agent_id")) == str(agent_id):
+            return agent
+    return None
+
+
+def _set_state_pose(state, pos):
+    if state is None or pos is None:
+        return
+    target = None
+    if isinstance(state.get("pose"), dict):
+        target = state["pose"]
+    elif isinstance(state.get("position"), dict):
+        target = state["position"]
+    else:
+        target = {}
+        state["pose"] = target
+    target["x"] = float(pos[0])
+    target["y"] = float(pos[1])
+    target["z"] = float(pos[2]) if len(pos) > 2 else 0.0
 
 
 def _axis_indices(axes):
@@ -221,49 +280,135 @@ def main():
     parser.add_argument("--output_anim", type=str, default="traj_anim.gif")
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--show_all", action="store_true")
+    parser.add_argument("--ego_track", type=str, default=None)
+    parser.add_argument("--obj_track", type=str, default=None)
+    parser.add_argument("--pred_mode", type=str, default=None)
     args = parser.parse_args()
 
     ego = _load_json(args.ego_json)
     obj = _load_json(args.obj_json)
-    frames = _sorted_frames(ego["frames"])
-    if args.start_frame not in frames or args.impact_frame not in frames:
-        raise ValueError("start_frame/impact_frame not found in ego frames.")
+    scene_payload = None
+    if is_scene_traj(ego):
+        scene_payload = ego
+    elif is_scene_traj(obj):
+        scene_payload = obj
 
-    ego_positions = _extract_ego_positions(frames, ego["frames"])
-    obj_ids = _collect_obj_ids(obj["frames"])
-    if args.obj_id not in obj_ids:
-        raise ValueError(f"obj_id '{args.obj_id}' not found in obj_traj.json")
-    obj_positions_map = _extract_all_obj_positions(frames, obj["frames"], obj_ids)
-    obj_positions = obj_positions_map[args.obj_id]
+    if scene_payload:
+        time_base = scene_payload.get("time_base") or {}
+        dt = time_base.get("dt")
+        try:
+            dt = float(dt)
+        except (TypeError, ValueError):
+            dt = None
+        ego_agent = _find_agent(scene_payload, "ego")
+        if ego_agent is None:
+            raise ValueError("ego agent not found in scene trajectory.")
+        obj_agent = _find_agent(scene_payload, args.obj_id)
+        if obj_agent is None:
+            raise ValueError(f"obj_id '{args.obj_id}' not found in scene trajectory.")
 
-    if args.fill_missing:
-        last = None
-        for i, p in enumerate(obj_positions):
-            if p is None and last is not None:
-                obj_positions[i] = last.copy()
-            elif p is not None:
-                last = p
-        obj_positions_map[args.obj_id] = obj_positions
+        ego_pref = [args.ego_track] if args.ego_track else ["history", "observed", "planned", "predicted"]
+        obj_pref = [args.obj_track] if args.obj_track else ["observed", "history", "predicted", "planned"]
+        _, ego_track_entry = select_track(ego_agent.get("tracks", {}), ego_pref)
+        _, obj_track_entry = select_track(obj_agent.get("tracks", {}), obj_pref)
+        ego_states = resolve_states_ref(ego_track_entry, pred_mode=args.pred_mode)
+        obj_states = resolve_states_ref(obj_track_entry, pred_mode=args.pred_mode)
+        if not ego_states or not obj_states:
+            raise ValueError("Missing states for ego or target object track.")
 
-    start_idx = frames.index(args.start_frame)
-    impact_idx = frames.index(args.impact_frame)
+        frame_times, obj_positions = _extract_state_series(obj_states, dt)
+        if not frame_times:
+            raise ValueError("Target object track has no timestamps.")
+        ego_times, ego_positions_raw = _extract_state_series(ego_states, dt)
+        ego_series = [
+            (t_val, pos)
+            for t_val, pos in zip(ego_times, ego_positions_raw)
+            if pos is not None
+        ]
+        ego_positions = sample_positions_by_time(ego_series, frame_times)
+        frames = [f"{t:.3f}" for t in frame_times]
+
+        start_idx = _resolve_time_index(frame_times, args.start_frame)
+        impact_idx = _resolve_time_index(frame_times, args.impact_frame)
+
+        if args.fill_missing:
+            last = None
+            for i, p in enumerate(obj_positions):
+                if p is None and last is not None:
+                    obj_positions[i] = last.copy()
+                elif p is not None:
+                    last = p
+    else:
+        frames = _sorted_frames(ego["frames"])
+        if args.start_frame not in frames or args.impact_frame not in frames:
+            raise ValueError("start_frame/impact_frame not found in ego frames.")
+
+        ego_positions = _extract_ego_positions(frames, ego["frames"])
+        obj_ids = _collect_obj_ids(obj["frames"])
+        if args.obj_id not in obj_ids:
+            raise ValueError(f"obj_id '{args.obj_id}' not found in obj_traj.json")
+        obj_positions_map = _extract_all_obj_positions(frames, obj["frames"], obj_ids)
+        obj_positions = obj_positions_map[args.obj_id]
+
+    if not scene_payload:
+        if args.fill_missing:
+            last = None
+            for i, p in enumerate(obj_positions):
+                if p is None and last is not None:
+                    obj_positions[i] = last.copy()
+                elif p is not None:
+                    last = p
+            obj_positions_map[args.obj_id] = obj_positions
+
+        start_idx = frames.index(args.start_frame)
+        impact_idx = frames.index(args.impact_frame)
+
     impact_offset = np.array([float(x) for x in args.impact_offset.split(",")], dtype=np.float32)
 
     new_positions = _modify_positions(
         obj_positions, ego_positions, start_idx, impact_idx,
         impact_offset, args.keep_z, args.method, args.post_impact
     )
-    obj_positions_map[args.obj_id] = new_positions
+    if scene_payload:
+        for state, pos in zip(obj_states, new_positions):
+            if pos is not None:
+                _set_state_pose(state, pos)
+        if args.only_target:
+            obj_positions_map = {args.obj_id: new_positions}
+        else:
+            obj_positions_map = {}
+            for agent in scene_payload.get("agents", []):
+                agent_id = str(agent.get("agent_id"))
+                if agent_id == "ego":
+                    continue
+                if agent_id == args.obj_id:
+                    obj_positions_map[agent_id] = new_positions
+                    continue
+                _, track_entry = select_track(agent.get("tracks", {}), obj_pref)
+                states = resolve_states_ref(track_entry, pred_mode=args.pred_mode)
+                if not states:
+                    continue
+                other_times, other_positions = _extract_state_series(states, dt)
+                series = [
+                    (t_val, pos)
+                    for t_val, pos in zip(other_times, other_positions)
+                    if pos is not None
+                ]
+                obj_positions_map[agent_id] = sample_positions_by_time(series, frame_times)
 
-    cumulative = _rebuild_cumulative_positions(new_positions)
-    for i, frame_id in enumerate(frames):
-        entry = obj["frames"].setdefault(frame_id, {"others": {}})
-        entry.setdefault("others", {})
-        entry["others"][args.obj_id] = cumulative[i]
+        _save_json(args.out_obj_json, scene_payload)
+    else:
+        obj_positions_map[args.obj_id] = new_positions
 
-    _save_json(args.out_obj_json, obj)
-    if args.only_target:
-        obj_positions_map = {args.obj_id: new_positions}
+        cumulative = _rebuild_cumulative_positions(new_positions)
+        for i, frame_id in enumerate(frames):
+            entry = obj["frames"].setdefault(frame_id, {"others": {}})
+            entry.setdefault("others", {})
+            entry["others"][args.obj_id] = cumulative[i]
+
+        _save_json(args.out_obj_json, obj)
+        if args.only_target:
+            obj_positions_map = {args.obj_id: new_positions}
     _render_animation(
         frames, ego_positions, obj_positions_map, args.obj_id, args.axes,
         args.output_anim, args.fps, args.show_all, args.collision_dist

@@ -16,6 +16,7 @@ from gaussian_renderer import render
 from scene import Scene, GaussianModel, EnvLight, ColorCorrection, PoseCorrection
 from scene.cameras import Camera
 from utils.general_utils import seed_everything
+from utils.traj_schema import cumulative_points_by_time, extract_scene_tracks, is_scene_traj
 
 EPS = 1e-6
 
@@ -406,6 +407,93 @@ def _export_obj_traj_json(path, frame_ids, obj_track_frames, coord_mode):
         json.dump(payload, f, indent=2)
 
 
+def _export_scene_traj_json(path, frame_ids, frame_times, ego_track_frames,
+                            obj_track_frames, coord_mode, scene_id=None):
+    if not path:
+        return
+    if not frame_times:
+        frame_times = [float(i) for i in range(len(frame_ids))]
+    dt = None
+    if len(frame_times) > 1:
+        diffs = [frame_times[i + 1] - frame_times[i] for i in range(len(frame_times) - 1)]
+        diffs = [d for d in diffs if d > 0]
+        if diffs:
+            dt = float(np.median(diffs))
+    horizon = None
+    if frame_times:
+        horizon = float(frame_times[-1] - frame_times[0])
+    payload = {
+        "schema_version": "1.0",
+        "scene_id": scene_id or "scene",
+        "timestamp": {
+            "type": "relative",
+            "unit": "s",
+            "t0": float(frame_times[0]) if frame_times else 0.0,
+        },
+        "frame_id": coord_mode or "world",
+    }
+    if dt is not None and horizon is not None:
+        payload["time_base"] = {
+            "type": "relative",
+            "unit": "s",
+            "dt": dt,
+            "horizon": horizon,
+        }
+
+    def _last_pose(points):
+        if not points:
+            return None
+        pos = points[-1]
+        if pos is None:
+            return None
+        x_val = float(pos[0])
+        y_val = float(pos[1])
+        z_val = float(pos[2]) if len(pos) > 2 else 0.0
+        return {"x": x_val, "y": y_val, "z": z_val}
+
+    agents = []
+    ego_states = []
+    for idx, points in enumerate(ego_track_frames or []):
+        pose = _last_pose(points)
+        if pose is None:
+            continue
+        t_val = frame_times[idx] if idx < len(frame_times) else float(idx)
+        ego_states.append({"t": float(t_val), "pose": pose})
+    if ego_states:
+        agents.append({
+            "agent_id": "ego",
+            "tracks": {
+                "history": {
+                    "source": "render",
+                    "states": ego_states,
+                }
+            },
+        })
+
+    for obj_id, frames_seq in (obj_track_frames or {}).items():
+        obj_states = []
+        for idx, points in enumerate(frames_seq):
+            pose = _last_pose(points)
+            if pose is None:
+                continue
+            t_val = frame_times[idx] if idx < len(frame_times) else float(idx)
+            obj_states.append({"t": float(t_val), "pose": pose})
+        if obj_states:
+            agents.append({
+                "agent_id": str(obj_id),
+                "tracks": {
+                    "observed": {
+                        "source": "render",
+                        "states": obj_states,
+                    }
+                },
+            })
+
+    payload["agents"] = agents
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
 def _draw_rounded_rect(image, x, y, w, h, radius, color, thickness):
     if w <= 1 or h <= 1:
         return
@@ -457,11 +545,16 @@ def main():
     parser.add_argument("--id_scale", type=float, default=0.6)
     parser.add_argument("--ego_traj_json", type=str, default=None)
     parser.add_argument("--obj_traj_json", type=str, default=None)
+    parser.add_argument("--traj_json", type=str, default=None)
     parser.add_argument("--export_ego_traj_json", type=str, default=None)
     parser.add_argument("--export_obj_traj_json", type=str, default=None)
+    parser.add_argument("--export_traj_json", type=str, default=None)
     parser.add_argument("--export_traj_only", action="store_true")
     parser.add_argument("--use_source_traj", action="store_true")
     parser.add_argument("--no_source_traj", action="store_false", dest="use_source_traj")
+    parser.add_argument("--ego_track", type=str, default=None)
+    parser.add_argument("--obj_track", type=str, default=None)
+    parser.add_argument("--pred_mode", type=str, default=None)
     parser.add_argument("--max_obj_tracks", type=int, default=0)
     parser.add_argument("--traj_panel", type=str, default="0.76,0.70,0.20,0.20")
     parser.add_argument("--traj_border_color", type=str, default="0,0,0")
@@ -580,8 +673,18 @@ def main():
     frame_timestamps = {frame_id: _get_frame_timestamp(frames[frame_id]) for frame_id in frame_ids}
 
     box_frames = _load_box_frames(_load_json(args.box_json))
-    ego_traj_frames, ego_coord = _load_traj_frames(_load_json(args.ego_traj_json))
-    obj_traj_frames, obj_coord = _load_traj_frames(_load_json(args.obj_traj_json))
+    traj_scene = _load_json(args.traj_json) if args.traj_json else None
+    ego_traj_payload = _load_json(args.ego_traj_json)
+    obj_traj_payload = _load_json(args.obj_traj_json)
+    if traj_scene is None:
+        if is_scene_traj(ego_traj_payload):
+            traj_scene = ego_traj_payload
+            ego_traj_payload = None
+        elif is_scene_traj(obj_traj_payload):
+            traj_scene = obj_traj_payload
+            obj_traj_payload = None
+    ego_traj_frames, ego_coord = _load_traj_frames(ego_traj_payload)
+    obj_traj_frames, obj_coord = _load_traj_frames(obj_traj_payload)
 
     use_source_traj = args.use_source_traj
     ego_track_frames = []
@@ -589,7 +692,24 @@ def main():
     ego_mode = "world"
     obj_mode = "world"
 
-    if ego_traj_frames:
+    frame_times = [frame_timestamps[frame_id] for frame_id in frame_ids]
+
+    if traj_scene and is_scene_traj(traj_scene):
+        coord_mode, ego_series, obj_series, _ = extract_scene_tracks(
+            traj_scene,
+            ego_track=args.ego_track,
+            obj_track=args.obj_track,
+            pred_mode=args.pred_mode,
+        )
+        if ego_series:
+            ego_track_frames = cumulative_points_by_time(ego_series, frame_times)
+            ego_mode = coord_mode
+        if obj_series:
+            for obj_id, series in obj_series.items():
+                obj_track_frames[str(obj_id)] = cumulative_points_by_time(series, frame_times)
+            obj_mode = coord_mode
+
+    if not ego_track_frames and ego_traj_frames:
         ego_mode = ego_coord
         for frame_id in frame_ids:
             key = _normalize_frame_key(frame_id)
@@ -606,7 +726,7 @@ def main():
                 accum.append(pos)
             ego_track_frames.append(list(accum))
 
-    if obj_traj_frames:
+    if not obj_track_frames and obj_traj_frames:
         obj_mode = obj_coord
         for frame_idx, frame_id in enumerate(frame_ids):
             key = _normalize_frame_key(frame_id)
@@ -639,9 +759,23 @@ def main():
 
     _export_ego_traj_json(args.export_ego_traj_json, frame_ids, ego_track_frames, ego_mode)
     _export_obj_traj_json(args.export_obj_traj_json, frame_ids, obj_track_frames, obj_mode)
+    if args.export_traj_json:
+        scene_id = os.path.basename(os.path.normpath(cfg.source_path)) if cfg.source_path else "scene"
+        scene_coord = ego_mode
+        if scene_coord == "world" and obj_mode != "world":
+            scene_coord = obj_mode
+        _export_scene_traj_json(
+            args.export_traj_json,
+            frame_ids,
+            frame_times,
+            ego_track_frames,
+            obj_track_frames,
+            scene_coord,
+            scene_id=scene_id,
+        )
     if args.export_traj_only:
-        if not (args.export_ego_traj_json or args.export_obj_traj_json):
-            raise ValueError("export_traj_only requires --export_ego_traj_json and/or --export_obj_traj_json.")
+        if not (args.export_ego_traj_json or args.export_obj_traj_json or args.export_traj_json):
+            raise ValueError("export_traj_only requires --export_ego_traj_json, --export_obj_traj_json, and/or --export_traj_json.")
         print("Trajectory export complete. Skipping video rendering.")
         return
 

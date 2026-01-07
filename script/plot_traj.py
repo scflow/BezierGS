@@ -10,6 +10,8 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from utils.traj_schema import (collect_frame_times, extract_scene_tracks, is_scene_traj,
+                               sample_positions_by_time)
 
 
 def _load_json(path):
@@ -87,6 +89,23 @@ def _compute_bounds(paths, pad=0.05):
     return (min_x - dx * pad, max_x + dx * pad), (min_y - dy * pad, max_y + dy * pad)
 
 
+def _load_scene_positions(scene_payload, ego_track, obj_track, pred_mode):
+    _, ego_series, obj_series, _ = extract_scene_tracks(
+        scene_payload,
+        ego_track=ego_track,
+        obj_track=obj_track,
+        pred_mode=pred_mode,
+    )
+    frame_times = collect_frame_times(ego_series, obj_series)
+    ego_positions = sample_positions_by_time(ego_series, frame_times)
+    obj_positions_map = {
+        obj_id: sample_positions_by_time(series, frame_times)
+        for obj_id, series in obj_series.items()
+    }
+    frame_labels = [f"{t:.3f}" for t in frame_times]
+    return frame_labels, ego_positions, obj_positions_map
+
+
 def main():
     parser = ArgumentParser(description="Plot trajectories with IDs.")
     parser.add_argument("--ego_json", type=str, required=True)
@@ -100,17 +119,34 @@ def main():
     parser.add_argument("--label_ego", action="store_true")
     parser.add_argument("--label_objects", action="store_true")
     parser.add_argument("--grid", action="store_true")
+    parser.add_argument("--ego_track", type=str, default=None)
+    parser.add_argument("--obj_track", type=str, default=None)
+    parser.add_argument("--pred_mode", type=str, default=None)
     args = parser.parse_args()
 
     ego = _load_json(args.ego_json)
     obj = _load_json(args.obj_json)
-    frames = _sorted_frames(ego["frames"])
-    if args.frame_stride > 1:
-        frames = frames[::args.frame_stride]
+    if is_scene_traj(ego) or is_scene_traj(obj):
+        scene_payload = ego if is_scene_traj(ego) else obj
+        frames, ego_positions, obj_positions_map = _load_scene_positions(
+            scene_payload, args.ego_track, args.obj_track, args.pred_mode
+        )
+        if args.frame_stride > 1:
+            idxs = list(range(0, len(frames), args.frame_stride))
+            frames = [frames[i] for i in idxs]
+            ego_positions = [ego_positions[i] for i in idxs]
+            obj_positions_map = {
+                obj_id: [positions[i] for i in idxs]
+                for obj_id, positions in obj_positions_map.items()
+            }
+    else:
+        frames = _sorted_frames(ego["frames"])
+        if args.frame_stride > 1:
+            frames = frames[::args.frame_stride]
 
-    obj_ids = _collect_obj_ids(obj["frames"])
-    ego_positions = _extract_ego_positions(frames, ego["frames"])
-    obj_positions_map = _extract_obj_positions(frames, obj["frames"], obj_ids)
+        obj_ids = _collect_obj_ids(obj["frames"])
+        ego_positions = _extract_ego_positions(frames, ego["frames"])
+        obj_positions_map = _extract_obj_positions(frames, obj["frames"], obj_ids)
 
     ax_i, ax_j = _axis_indices(args.axes)
     ego_xy = [p[[ax_i, ax_j]] if p is not None else None for p in ego_positions]
