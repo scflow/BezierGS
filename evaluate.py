@@ -171,18 +171,18 @@ if __name__ == "__main__":
     checkpoints = glob.glob(os.path.join(args.model_path, "chkpnt*.pth"))
     assert len(checkpoints) > 0, "No checkpoints found."
     checkpoint = sorted(checkpoints, key=lambda x: int(x.split("chkpnt")[-1].split(".")[0]))[-1]
-    (model_params, first_iter) = torch.load(checkpoint)
+    (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
     gaussians.restore(model_params, args)
     
     if env_map is not None:
         env_checkpoint = os.path.join(os.path.dirname(checkpoint), 
                                     os.path.basename(checkpoint).replace("chkpnt", "env_light_chkpnt"))
-        (light_params, _) = torch.load(env_checkpoint)
+        (light_params, _) = torch.load(env_checkpoint, weights_only=False)
         env_map.restore(light_params)
     if color_correction is not None:
         color_correction_checkpoint = os.path.join(os.path.dirname(args.checkpoint), 
                                     os.path.basename(args.checkpoint).replace("chkpnt", "color_correction_chkpnt"))
-        (color_correction_params, _) = torch.load(color_correction_checkpoint)
+        (color_correction_params, _) = torch.load(color_correction_checkpoint, weights_only=False)
         color_correction.restore(color_correction_params)
     if pose_correction is not None:
         pose_correction_checkpoint = os.path.join(os.path.dirname(args.checkpoint), 
