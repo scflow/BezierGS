@@ -275,16 +275,18 @@ class GaussianModel:
         gaussian_group = []
 
         obj_num = len(ply_dict.keys()) - 1 # 1 is background
-        self.trajectory_cp_tensor = torch.zeros([obj_num, 4, 3], dtype=torch.float32).cuda()
-        self.cp_recorded_timestamp_2_bezier_t = torch.zeros([obj_num, 4, 1], dtype=torch.float32).cuda()
-
+        # self.trajectory_cp_tensor = torch.zeros([obj_num, 4, 3], dtype=torch.float32).cuda()
+        # self.cp_recorded_timestamp_2_bezier_t = torch.zeros([obj_num, 4, 1], dtype=torch.float32).cuda()
+        # [修改] 不再写死 4，而是使用 self.num_control_points
+        self.trajectory_cp_tensor = torch.zeros([obj_num, self.num_control_points, 3], dtype=torch.float32).cuda()
+        self.cp_recorded_timestamp_2_bezier_t = torch.zeros([obj_num, self.num_control_points, 1], dtype=torch.float32).cuda()
         for k, v in ply_dict.items():
             if k == 'bkgd':
                 bg_xyz = torch.from_numpy(v['xyz_array']).float().cuda()
                 bg_color = torch.from_numpy(v['colors_array']).float().cuda()
                 control_points = bg_xyz
                 control_points = control_points.unsqueeze(1)
-                control_points = control_points.repeat(1, 4, 1)
+                control_points = control_points.repeat(1, self.num_control_points, 1)
 
                 # sphere init
                 r_max = 100000
@@ -297,7 +299,7 @@ class GaussianModel:
                 r_1 = s*1/r_min+(1-s)*1/r_max
                 r = 1/r_1
                 pts_sph = torch.stack([r*torch.cos(theta)*torch.cos(phi), r*torch.sin(theta)*torch.cos(phi), r*torch.sin(phi)],dim=-1).cuda()
-                pts_sph = pts_sph.unsqueeze(1).repeat(1, 4, 1)
+                pts_sph = pts_sph.unsqueeze(1).repeat(1, self.num_control_points, 1)
                 pts_sph[:, :, 2] = -pts_sph[:, :, 2]+1
                 control_points = torch.cat([control_points, pts_sph], dim=0)
                 bg_color = torch.cat([

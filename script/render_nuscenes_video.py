@@ -360,6 +360,52 @@ def _flatten_track_frames(track_frames):
     return flat
 
 
+def _serialize_points(points):
+    if not points:
+        return []
+    out = []
+    for p in points:
+        if p is None:
+            continue
+        if isinstance(p, np.ndarray):
+            out.append([float(x) for x in p.tolist()])
+        else:
+            out.append([float(x) for x in p])
+    return out
+
+
+def _export_ego_traj_json(path, frame_ids, ego_track_frames, coord_mode):
+    if not path:
+        return
+    frames = {}
+    for idx, frame_id in enumerate(frame_ids):
+        ego_pts = []
+        if ego_track_frames and idx < len(ego_track_frames):
+            ego_pts = _serialize_points(ego_track_frames[idx] or [])
+        frames[f"{int(frame_id):03d}"] = {"ego": ego_pts}
+    payload = {"coord": coord_mode, "frames": frames}
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def _export_obj_traj_json(path, frame_ids, obj_track_frames, coord_mode):
+    if not path:
+        return
+    frames = {}
+    for idx, frame_id in enumerate(frame_ids):
+        others = {}
+        for obj_id, seq in obj_track_frames.items():
+            if idx >= len(seq):
+                continue
+            pts = _serialize_points(seq[idx] or [])
+            if pts:
+                others[str(obj_id)] = pts
+        frames[f"{int(frame_id):03d}"] = {"others": others}
+    payload = {"coord": coord_mode, "frames": frames}
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
 def _draw_rounded_rect(image, x, y, w, h, radius, color, thickness):
     if w <= 1 or h <= 1:
         return
@@ -411,6 +457,9 @@ def main():
     parser.add_argument("--id_scale", type=float, default=0.6)
     parser.add_argument("--ego_traj_json", type=str, default=None)
     parser.add_argument("--obj_traj_json", type=str, default=None)
+    parser.add_argument("--export_ego_traj_json", type=str, default=None)
+    parser.add_argument("--export_obj_traj_json", type=str, default=None)
+    parser.add_argument("--export_traj_only", action="store_true")
     parser.add_argument("--use_source_traj", action="store_true")
     parser.add_argument("--no_source_traj", action="store_false", dest="use_source_traj")
     parser.add_argument("--max_obj_tracks", type=int, default=0)
@@ -587,6 +636,14 @@ def main():
                     accum.append(pos)
                 frames_seq.append(list(accum))
             obj_track_frames[obj_id] = frames_seq
+
+    _export_ego_traj_json(args.export_ego_traj_json, frame_ids, ego_track_frames, ego_mode)
+    _export_obj_traj_json(args.export_obj_traj_json, frame_ids, obj_track_frames, obj_mode)
+    if args.export_traj_only:
+        if not (args.export_ego_traj_json or args.export_obj_traj_json):
+            raise ValueError("export_traj_only requires --export_ego_traj_json and/or --export_obj_traj_json.")
+        print("Trajectory export complete. Skipping video rendering.")
+        return
 
     traj_bounds = None
     if (ego_track_frames or obj_track_frames) and (ego_mode != "normalized" or obj_mode != "normalized"):
