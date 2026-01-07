@@ -14,6 +14,7 @@ from omegaconf import OmegaConf
 
 from gaussian_renderer import render
 from scene import Scene, GaussianModel, EnvLight, ColorCorrection, PoseCorrection
+from scene.cameras import Camera
 from utils.general_utils import seed_everything
 
 EPS = 1e-6
@@ -70,6 +71,94 @@ def _build_frames(cameras):
         cam_id = int(cam.colmap_id % 10)
         frames.setdefault(frame_id, {})[cam_id] = cam
     return frames
+
+
+def _normalize_cam_name(name):
+    name = str(name).upper()
+    if name.startswith("CAM_"):
+        name = name[4:]
+    return name
+
+
+def _quat_wxyz_to_rot(q):
+    w, x, y, z = q
+    r11 = 1.0 - 2.0 * y * y - 2.0 * z * z
+    r12 = 2.0 * x * y - 2.0 * w * z
+    r13 = 2.0 * x * z + 2.0 * w * y
+    r21 = 2.0 * x * y + 2.0 * w * z
+    r22 = 1.0 - 2.0 * x * x - 2.0 * z * z
+    r23 = 2.0 * y * z - 2.0 * w * x
+    r31 = 2.0 * x * z - 2.0 * w * y
+    r32 = 2.0 * y * z + 2.0 * w * x
+    r33 = 1.0 - 2.0 * x * x - 2.0 * y * y
+    return np.array([[r11, r12, r13],
+                     [r21, r22, r23],
+                     [r31, r32, r33]], dtype=np.float32)
+
+
+def _load_camera_extrinsics(path):
+    if not path:
+        return None
+    raw = _load_json(path)
+    extrinsics = {}
+    for name, entry in raw.items():
+        cam_name = _normalize_cam_name(name)
+        if "rotation_wxyz" in entry:
+            quat = entry["rotation_wxyz"]
+        elif "rotation_xyzw" in entry:
+            q = entry["rotation_xyzw"]
+            quat = [q[3], q[0], q[1], q[2]]
+        elif "rotation" in entry:
+            quat = entry["rotation"]
+        else:
+            raise ValueError(f"Missing rotation in {name}")
+        if "translation" not in entry:
+            raise ValueError(f"Missing translation in {name}")
+        R = _quat_wxyz_to_rot(quat)
+        t = np.array(entry["translation"], dtype=np.float32)
+        T = np.eye(4, dtype=np.float32)
+        T[:3, :3] = R
+        T[:3, 3] = t
+        extrinsics[cam_name] = T
+    return extrinsics
+
+
+def _build_virtual_camera(base_cam, c2w, name, timestamp):
+    w2c = np.linalg.inv(c2w)
+    R = w2c[:3, :3].T
+    T = w2c[:3, 3]
+    if base_cam.cx is None:
+        fx = fy = cx = cy = None
+        fovx = base_cam.FoVx
+        fovy = base_cam.FoVy
+    else:
+        fx = float(base_cam.fx)
+        fy = float(base_cam.fy)
+        cx = float(base_cam.cx)
+        cy = float(base_cam.cy)
+        fovx = base_cam.FoVx
+        fovy = base_cam.FoVy
+    image = torch.zeros_like(base_cam.original_image)
+    return Camera(
+        colmap_id=base_cam.colmap_id,
+        uid=base_cam.uid,
+        R=R,
+        T=T,
+        FoVx=fovx,
+        FoVy=fovy,
+        cx=cx,
+        cy=cy,
+        fx=fx,
+        fy=fy,
+        image=image,
+        image_name=name,
+        trans=base_cam.trans,
+        scale=base_cam.scale,
+        data_device=str(base_cam.data_device),
+        timestamp=timestamp,
+        resolution=[base_cam.image_width, base_cam.image_height],
+        ncc_scale=base_cam.ncc_scale,
+    )
 
 
 def _resize_letterbox(image, target_w, target_h, bg_color):
@@ -280,6 +369,7 @@ def main():
     parser.add_argument("--bg_color", type=str, default="0,0,0")
     parser.add_argument("--cell_padding", type=int, default=8)
     parser.add_argument("--cam_order", type=str, default="0,1,2,3,4,5")
+    parser.add_argument("--camera_json", type=str, default=None)
     parser.add_argument("--show_cam_names", action="store_true")
     parser.add_argument("--box_json", type=str, default=None)
     parser.add_argument("--show_boxes", action="store_true")
@@ -350,15 +440,19 @@ def main():
         if os.path.exists(env_checkpoint):
             light_params, _ = torch.load(env_checkpoint)
             env_map.restore(light_params)
+    aux_checkpoint = getattr(cfg, "checkpoint", None)
+    if aux_checkpoint is None or str(aux_checkpoint).strip() == "":
+        aux_checkpoint = checkpoint
+    aux_checkpoint = os.path.expanduser(str(aux_checkpoint))
     if color_correction is not None:
-        cc_checkpoint = os.path.join(os.path.dirname(checkpoint),
-                                     os.path.basename(checkpoint).replace("chkpnt", "color_correction_chkpnt"))
+        cc_checkpoint = os.path.join(os.path.dirname(aux_checkpoint),
+                                     os.path.basename(aux_checkpoint).replace("chkpnt", "color_correction_chkpnt"))
         if os.path.exists(cc_checkpoint):
             cc_params, _ = torch.load(cc_checkpoint)
             color_correction.restore(cc_params)
     if pose_correction is not None:
-        pc_checkpoint = os.path.join(os.path.dirname(checkpoint),
-                                     os.path.basename(checkpoint).replace("chkpnt", "pose_correction_chkpnt"))
+        pc_checkpoint = os.path.join(os.path.dirname(aux_checkpoint),
+                                     os.path.basename(aux_checkpoint).replace("chkpnt", "pose_correction_chkpnt"))
         if os.path.exists(pc_checkpoint):
             pc_params, _ = torch.load(pc_checkpoint)
             pose_correction.restore(pc_params)
@@ -381,6 +475,13 @@ def main():
     if ego_cam_name not in cam_name_to_id:
         raise ValueError(f"Unknown ego_cam_name '{args.ego_cam_name}'. Use one of {CAM_NAME_ORDER}.")
     ego_cam_id = cam_name_to_id[ego_cam_name]
+    camera_extrinsics = _load_camera_extrinsics(args.camera_json)
+    if camera_extrinsics:
+        missing = [name for name in CAM_NAME_ORDER if name not in camera_extrinsics]
+        if missing:
+            raise ValueError(f"camera_json missing cameras: {missing}")
+        if ego_cam_name not in camera_extrinsics:
+            raise ValueError(f"camera_json missing anchor camera '{ego_cam_name}'")
 
     frame_timestamps = {frame_id: _get_frame_timestamp(frames[frame_id]) for frame_id in frame_ids}
 
@@ -496,10 +597,28 @@ def main():
                       (frame_margin, frame_margin),
                       (canvas_w - frame_margin, canvas_h - frame_margin),
                       frame_color, frame_border)
+        virtual_cams = None
+        if camera_extrinsics:
+            ref_cam = frames[frame_id].get(ego_cam_id)
+            if ref_cam is None:
+                continue
+            ref_c2w = ref_cam.c2w.detach().cpu().numpy()
+            T_world_ego = ref_c2w @ np.linalg.inv(camera_extrinsics[ego_cam_name])
+            virtual_cams = {}
+            for cam_name in CAM_NAME_ORDER:
+                cam_id = cam_name_to_id.get(cam_name)
+                base_cam = frames[frame_id].get(cam_id) if cam_id is not None else None
+                if base_cam is None:
+                    base_cam = ref_cam
+                c2w = T_world_ego @ camera_extrinsics[cam_name]
+                virtual_cams[cam_name] = _build_virtual_camera(base_cam, c2w, cam_name, ref_cam.timestamp)
         for r, row in enumerate(CAM_LAYOUT):
             for c, cam_name in enumerate(row):
                 cam_id = cam_name_to_id.get(cam_name)
-                cam = frames[frame_id].get(cam_id) if cam_id is not None else None
+                if virtual_cams is not None:
+                    cam = virtual_cams.get(cam_name)
+                else:
+                    cam = frames[frame_id].get(cam_id) if cam_id is not None else None
                 cell = np.full((cell_h, cell_w, 3), bg_color_bgr, dtype=np.uint8)
                 if cam is not None:
                     v, _ = scene.gaussians.get_inst_velocity(cam.timestamp)
