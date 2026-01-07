@@ -23,7 +23,6 @@ EPS = 1e-6
 CAM_NAME_ORDER = ["FRONT", "FRONT_RIGHT", "FRONT_LEFT", "BACK", "BACK_RIGHT", "BACK_LEFT"]
 CAM_LAYOUT = [
     ["FRONT_LEFT", "FRONT", "FRONT_RIGHT"],
-    ["BACK_LEFT", "BACK", "BACK_RIGHT"],
 ]
 
 
@@ -73,6 +72,15 @@ def _build_frames(cameras):
     return frames
 
 
+def _get_layout_names():
+    names = []
+    for row in CAM_LAYOUT:
+        for name in row:
+            if name not in names:
+                names.append(name)
+    return names
+
+
 def _normalize_cam_name(name):
     name = str(name).upper()
     if name.startswith("CAM_"):
@@ -96,7 +104,7 @@ def _quat_wxyz_to_rot(q):
                      [r31, r32, r33]], dtype=np.float32)
 
 
-def _load_camera_extrinsics(path):
+def _load_camera_extrinsics(path, translation_scale=1.0):
     if not path:
         return None
     raw = _load_json(path)
@@ -115,7 +123,7 @@ def _load_camera_extrinsics(path):
         if "translation" not in entry:
             raise ValueError(f"Missing translation in {name}")
         R = _quat_wxyz_to_rot(quat)
-        t = np.array(entry["translation"], dtype=np.float32)
+        t = np.array(entry["translation"], dtype=np.float32) * float(translation_scale)
         T = np.eye(4, dtype=np.float32)
         T[:3, :3] = R
         T[:3, 3] = t
@@ -289,9 +297,10 @@ def _map_traj_point(pos, bounds, axes, panel, flip_y, pad_frac):
 
 
 def _draw_trajectory_panel(image, panel, ego_track, obj_tracks, traj_bounds, traj_axes,
-                           traj_pad, flip_y, ego_color, obj_color, thickness, point_radius):
+                           traj_pad, flip_y, ego_color, obj_color, thickness, point_radius,
+                           border_color, border_thickness, border_radius):
     x0, y0, w, h = panel
-    cv2.rectangle(image, (x0, y0), (x0 + w, y0 + h), (64, 64, 64), 1)
+    _draw_rounded_rect(image, x0, y0, w, h, border_radius, border_color, border_thickness)
     if traj_bounds is None:
         return
     # Ego trajectory.
@@ -351,6 +360,26 @@ def _flatten_track_frames(track_frames):
     return flat
 
 
+def _draw_rounded_rect(image, x, y, w, h, radius, color, thickness):
+    if w <= 1 or h <= 1:
+        return
+    radius = int(max(0, radius))
+    radius = min(radius, w // 2, h // 2)
+    x1 = x + w - 1
+    y1 = y + h - 1
+    if radius == 0:
+        cv2.rectangle(image, (x, y), (x1, y1), color, thickness)
+        return
+    cv2.line(image, (x + radius, y), (x1 - radius, y), color, thickness)
+    cv2.line(image, (x + radius, y1), (x1 - radius, y1), color, thickness)
+    cv2.line(image, (x, y + radius), (x, y1 - radius), color, thickness)
+    cv2.line(image, (x1, y + radius), (x1, y1 - radius), color, thickness)
+    cv2.ellipse(image, (x + radius, y + radius), (radius, radius), 180, 0, 90, color, thickness)
+    cv2.ellipse(image, (x1 - radius, y + radius), (radius, radius), 270, 0, 90, color, thickness)
+    cv2.ellipse(image, (x1 - radius, y1 - radius), (radius, radius), 0, 0, 90, color, thickness)
+    cv2.ellipse(image, (x + radius, y1 - radius), (radius, radius), 90, 0, 90, color, thickness)
+
+
 @torch.no_grad()
 def main():
     parser = ArgumentParser(description="Render nuScenes-layout video")
@@ -366,10 +395,12 @@ def main():
     parser.add_argument("--frame_margin", type=int, default=24)
     parser.add_argument("--frame_border", type=int, default=6)
     parser.add_argument("--frame_color", type=str, default="255,255,255")
-    parser.add_argument("--bg_color", type=str, default="0,0,0")
+    parser.add_argument("--bg_color", type=str, default="255,255,255")
     parser.add_argument("--cell_padding", type=int, default=8)
-    parser.add_argument("--cam_order", type=str, default="0,1,2,3,4,5")
+    parser.add_argument("--cam_order", type=str, default="0,1,2")
     parser.add_argument("--camera_json", type=str, default=None)
+    parser.add_argument("--camera_translation_scale", type=float, default=-1.0)
+    parser.add_argument("--camera_translation_zero", action="store_true")
     parser.add_argument("--show_cam_names", action="store_true")
     parser.add_argument("--box_json", type=str, default=None)
     parser.add_argument("--show_boxes", action="store_true")
@@ -383,7 +414,10 @@ def main():
     parser.add_argument("--use_source_traj", action="store_true")
     parser.add_argument("--no_source_traj", action="store_false", dest="use_source_traj")
     parser.add_argument("--max_obj_tracks", type=int, default=0)
-    parser.add_argument("--traj_panel", type=str, default="0.68,0.62,0.30,0.30")
+    parser.add_argument("--traj_panel", type=str, default="0.76,0.70,0.20,0.20")
+    parser.add_argument("--traj_border_color", type=str, default="0,0,0")
+    parser.add_argument("--traj_border_thickness", type=int, default=2)
+    parser.add_argument("--traj_border_radius", type=int, default=10)
     parser.add_argument("--traj_axes", type=str, default="xy", choices=["xy", "xz", "yz"])
     parser.add_argument("--traj_pad", type=float, default=0.05)
     parser.add_argument("--traj_flip_y", action="store_true")
@@ -431,14 +465,14 @@ def main():
             raise FileNotFoundError("No checkpoints found in model_path.")
         checkpoint = sorted(checkpoints, key=lambda x: int(x.split("chkpnt")[-1].split(".")[0]))[-1]
     checkpoint = os.path.expanduser(str(checkpoint))
-    model_params, first_iter = torch.load(checkpoint)
+    model_params, first_iter = torch.load(checkpoint, weights_only=False)
     gaussians.restore(model_params, cfg)
 
     if env_map is not None:
         env_checkpoint = os.path.join(os.path.dirname(checkpoint),
                                       os.path.basename(checkpoint).replace("chkpnt", "env_light_chkpnt"))
         if os.path.exists(env_checkpoint):
-            light_params, _ = torch.load(env_checkpoint)
+            light_params, _ = torch.load(env_checkpoint, weights_only=False)
             env_map.restore(light_params)
     aux_checkpoint = getattr(cfg, "checkpoint", None)
     if aux_checkpoint is None or str(aux_checkpoint).strip() == "":
@@ -448,13 +482,13 @@ def main():
         cc_checkpoint = os.path.join(os.path.dirname(aux_checkpoint),
                                      os.path.basename(aux_checkpoint).replace("chkpnt", "color_correction_chkpnt"))
         if os.path.exists(cc_checkpoint):
-            cc_params, _ = torch.load(cc_checkpoint)
+            cc_params, _ = torch.load(cc_checkpoint, weights_only=False)
             color_correction.restore(cc_params)
     if pose_correction is not None:
         pc_checkpoint = os.path.join(os.path.dirname(aux_checkpoint),
                                      os.path.basename(aux_checkpoint).replace("chkpnt", "pose_correction_chkpnt"))
         if os.path.exists(pc_checkpoint):
-            pc_params, _ = torch.load(pc_checkpoint)
+            pc_params, _ = torch.load(pc_checkpoint, weights_only=False)
             pose_correction.restore(pc_params)
 
     bg_color = [1, 1, 1] if cfg.white_background else [0, 0, 0]
@@ -468,16 +502,27 @@ def main():
     if args.max_frames > 0:
         frame_ids = frame_ids[:args.max_frames]
 
-    cam_order = _parse_int_list(args.cam_order, expected_len=6)
-    cam_name_to_id = dict(zip(CAM_NAME_ORDER, cam_order))
+    cam_order = _parse_int_list(args.cam_order)
+    if len(cam_order) == 6:
+        cam_name_to_id = dict(zip(CAM_NAME_ORDER, cam_order))
+    elif len(cam_order) == 3:
+        cam_name_to_id = dict(zip(["FRONT", "FRONT_LEFT", "FRONT_RIGHT"], cam_order))
+    else:
+        raise ValueError("cam_order must have 3 or 6 values.")
 
     ego_cam_name = args.ego_cam_name.upper()
     if ego_cam_name not in cam_name_to_id:
         raise ValueError(f"Unknown ego_cam_name '{args.ego_cam_name}'. Use one of {CAM_NAME_ORDER}.")
     ego_cam_id = cam_name_to_id[ego_cam_name]
-    camera_extrinsics = _load_camera_extrinsics(args.camera_json)
+    trans_scale = args.camera_translation_scale
+    if args.camera_translation_zero:
+        trans_scale = 0.0
+    elif trans_scale < 0.0:
+        trans_scale = float(scene.scale_factor)
+    camera_extrinsics = _load_camera_extrinsics(args.camera_json, translation_scale=trans_scale)
     if camera_extrinsics:
-        missing = [name for name in CAM_NAME_ORDER if name not in camera_extrinsics]
+        layout_names = _get_layout_names()
+        missing = [name for name in layout_names if name not in camera_extrinsics]
         if missing:
             raise ValueError(f"camera_json missing cameras: {missing}")
         if ego_cam_name not in camera_extrinsics:
@@ -571,8 +616,10 @@ def main():
         int(panel_ratio[2] * canvas_w),
         int(panel_ratio[3] * canvas_h),
     )
+    traj_border_color = _parse_color_bgr(args.traj_border_color)
 
-    rows, cols = 2, 3
+    rows = len(CAM_LAYOUT)
+    cols = max(len(row) for row in CAM_LAYOUT)
     inner_w = canvas_w - 2 * frame_margin - 2 * frame_border
     inner_h = canvas_h - 2 * frame_margin - 2 * frame_border
     cell_w = max(1, (inner_w - cell_padding * (cols - 1)) // cols)
@@ -605,7 +652,7 @@ def main():
             ref_c2w = ref_cam.c2w.detach().cpu().numpy()
             T_world_ego = ref_c2w @ np.linalg.inv(camera_extrinsics[ego_cam_name])
             virtual_cams = {}
-            for cam_name in CAM_NAME_ORDER:
+            for cam_name in _get_layout_names():
                 cam_id = cam_name_to_id.get(cam_name)
                 base_cam = frames[frame_id].get(cam_id) if cam_id is not None else None
                 if base_cam is None:
@@ -650,6 +697,11 @@ def main():
                 canvas[y0:y0 + cell_h, x0:x0 + cell_w] = cell
 
         if ego_track_frames or obj_track_frames:
+            draw_border_only = not ((ego_mode != "normalized" and ego_track_frames) or
+                                    (obj_mode != "normalized" and obj_track_frames))
+            if draw_border_only:
+                _draw_rounded_rect(canvas, panel[0], panel[1], panel[2], panel[3],
+                                   args.traj_border_radius, traj_border_color, args.traj_border_thickness)
             if ego_mode == "normalized" and ego_track_frames:
                 ego_pts = []
                 for p in ego_track_frames[frame_idx] or []:
@@ -679,7 +731,8 @@ def main():
                         obj_sub[k] = seq[frame_idx] if frame_idx < len(seq) else None
                 _draw_trajectory_panel(canvas, panel, ego_sub, obj_sub, traj_bounds, args.traj_axes,
                                        args.traj_pad, args.traj_flip_y, ego_color, obj_color,
-                                       args.traj_thickness, args.traj_point_radius)
+                                       args.traj_thickness, args.traj_point_radius,
+                                       traj_border_color, args.traj_border_thickness, args.traj_border_radius)
 
         frame_rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
         writer.append_data(frame_rgb)

@@ -211,7 +211,32 @@ def training(args):
             log_dict["loss_norm"] = loss_norm.item()
             loss += args.lambda_icc * loss_norm
 
+        lambda_ground = getattr(args, "lambda_ground", 1.0)
+        if lambda_ground > 0 and gaussians.group_num > 0:
+            cur_xyz, _, _ = gaussians.get_xyz_with_offset(viewpoint_cam.timestamp)
+            ground_loss = 0.0
+            count = 0
+            for g_id in range(1, gaussians.group_num + 1):
+                car_mask = gaussians.get_group == g_id
+                if not car_mask.any():
+                    continue
+                car_z = cur_xyz[car_mask][:, 2]
+                if car_z.numel() == 0:
+                    continue
+                k = max(10, int(car_z.shape[0] * 0.005))
+                k = min(k, int(car_z.shape[0]))
+                bottom_z, _ = torch.topk(car_z, k, largest=False)
+                dist_from_ground = torch.relu(bottom_z)
+                ground_loss += dist_from_ground.mean()
+                count += 1
+            if count > 0:
+                loss += lambda_ground * (ground_loss / count)
+                log_dict["loss_ground"] = (ground_loss / count).item()
+
         loss.backward()
+        if hasattr(gaussians, "trajectory_cp_tensor") and gaussians.trajectory_cp_tensor is not None:
+            if gaussians.trajectory_cp_tensor.grad is not None:
+                gaussians.trajectory_cp_tensor.grad[..., 2] = 0.0
         log_dict['loss'] = loss.item()
         
         iter_end.record()

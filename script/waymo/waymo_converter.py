@@ -273,9 +273,11 @@ def parse_seq_rawdata(process_list, root_dir, seq_name, seq_save_dir, track_file
                 
                 # build 3D bounding box dimension
                 length, width, height = box.length, box.width, box.height
+                height = height + 0.3
                 
                 # build 3D bounding box pose
                 tx, ty, tz = box.center_x, box.center_y, box.center_z
+                tz = tz - 0.15
                 heading = box.heading
                 c = math.cos(heading)
                 s = math.sin(heading)
